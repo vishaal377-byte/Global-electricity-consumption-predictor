@@ -1,0 +1,2 @@
+artifacts/random_forest_IS2cleaned_data_model.joblib filter=lfs diff=lfs merge=lfs -text
+artifacts/random_forest_IS2_model.joblib filter=lfs diff=lfs merge=lfs -text
