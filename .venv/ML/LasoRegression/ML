@@ -1,0 +1,153 @@
+"""Train a Lasso regression model for primary energy consumption.
+
+The training workflow is based on the scikit-learn GitHub example for Lasso
+model selection: standardize features and select the regularization strength
+with cross-validation. This version adapts that workflow to the project's
+Excel/CSV database, categorical columns, and target.
+
+Reference:
+https://github.com/scikit-learn/scikit-learn/blob/main/examples/linear_model/plot_lasso_model_selection.py
+
+Run from the project root::
+
+    .venv/bin/python .venv/ML/LasoRegression/ML
+    .venv/bin/python .venv/ML/LasoRegression/ML --input another_database.xlsx
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LassoCV
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+SCRIPT_PATH = Path(__file__).resolve()
+PROJECT_ROOT = next(
+    (parent for parent in SCRIPT_PATH.parents if (parent / "ISDBcleaned_DB.xlsx").is_file()),
+    SCRIPT_PATH.parents[3],
+)
+DEFAULT_INPUT = PROJECT_ROOT / "ISDBcleaned_DB.xlsx"
+DEFAULT_TARGET = "primary_energy_consumption"
+DEFAULT_MODEL_OUTPUT = PROJECT_ROOT / "artifacts" / "lasso_energy_model.joblib"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help="Input Excel or CSV database")
+    parser.add_argument("--target", default=DEFAULT_TARGET, help="Numeric column to predict")
+    parser.add_argument("--test-size", type=float, default=0.2, help="Fraction of rows reserved for testing")
+    parser.add_argument("--model-output", type=Path, default=DEFAULT_MODEL_OUTPUT, help="Where to save the fitted model")
+    parser.add_argument("--cv", type=int, default=5, help="Number of training folds for Lasso alpha selection")
+    return parser.parse_args()
+
+
+def read_database(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() == ".csv":
+        return pd.read_csv(path)
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        return pd.read_excel(path)
+    raise ValueError("Input must be a .csv, .xlsx, or .xls file.")
+
+
+def main() -> None:
+    args = parse_args()
+    if not 0 < args.test_size < 1:
+        raise ValueError("--test-size must be greater than 0 and less than 1.")
+    if args.cv < 2:
+        raise ValueError("--cv must be at least 2.")
+    if not args.input.is_file():
+        raise FileNotFoundError(f"Database file not found: {args.input}")
+
+    data = read_database(args.input)
+    if args.target not in data.columns:
+        raise ValueError(
+            f"Target column {args.target!r} was not found. Available columns: "
+            + ", ".join(map(str, data.columns))
+        )
+
+    y = pd.to_numeric(data[args.target], errors="coerce")
+    valid_rows = y.notna()
+    dropped_rows = int((~valid_rows).sum())
+    X = data.loc[valid_rows].drop(columns=[args.target]).copy()
+    y = y.loc[valid_rows].astype(float)
+    if len(X) < args.cv + 1:
+        raise ValueError(f"At least {args.cv + 1} rows with numeric target values are required.")
+    if X.shape[1] == 0:
+        raise ValueError("The database needs at least one feature column in addition to the target.")
+
+    numeric_columns = X.select_dtypes(include=["number", "bool"]).columns.tolist()
+    categorical_columns = [column for column in X.columns if column not in numeric_columns]
+    transformers = []
+    if numeric_columns:
+        transformers.append((
+            "numeric",
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scale", StandardScaler()),
+            ]),
+            numeric_columns,
+        ))
+    if categorical_columns:
+        transformers.append((
+            "categorical",
+            Pipeline([
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("one_hot", OneHotEncoder(handle_unknown="ignore")),
+            ]),
+            categorical_columns,
+        ))
+
+    # Scale the combined matrix as well so one-hot indicators are comparable
+    # with continuous inputs. with_mean=False preserves sparse one-hot output.
+    model = Pipeline([
+        ("preprocessing", ColumnTransformer(transformers=transformers)),
+        ("scale", StandardScaler(with_mean=False)),
+        ("lasso", LassoCV(cv=args.cv, max_iter=50_000, n_jobs=-1, random_state=42)),
+    ])
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=args.test_size, random_state=42
+    )
+    if len(X_train) < args.cv:
+        raise ValueError("Training split has fewer rows than the requested CV folds.")
+    model.fit(X_train, y_train)
+    predictions = model.predict(X_test)
+    lasso = model.named_steps["lasso"]
+
+    train_percent = 100 * len(X_train) / len(X)
+    test_percent = 100 * len(X_test) / len(X)
+    print(f"Input: {args.input}")
+    print(f"Target: {args.target}")
+    print(f"Split: random (train={len(X_train)} / {train_percent:.1f}%, test={len(X_test)} / {test_percent:.1f}%)")
+    if dropped_rows:
+        print(f"Dropped {dropped_rows} row(s) with missing/non-numeric target.")
+    print(f"Feature columns: {len(X.columns)} ({len(numeric_columns)} numeric, {len(categorical_columns)} categorical)")
+    print(f"Selected alpha: {lasso.alpha_:.6g} (CV folds={args.cv})")
+    print(f"MAE:  {mean_absolute_error(y_test, predictions):.4f}")
+    print(f"RMSE: {np.sqrt(mean_squared_error(y_test, predictions)):.4f}")
+    print(f"R²:   {r2_score(y_test, predictions):.4f}")
+    print(f"Non-zero coefficients: {int(np.count_nonzero(lasso.coef_))}/{len(lasso.coef_)}")
+
+    args.model_output.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump({
+        "model": model,
+        "target": args.target,
+        "feature_columns": X.columns.tolist(),
+        "training_rows": len(X_train),
+        "test_size": args.test_size,
+        "alpha": float(lasso.alpha_),
+    }, args.model_output)
+    print(f"Saved model: {args.model_output}")
+
+
+if __name__ == "__main__":
+    main()
